@@ -1,96 +1,129 @@
 import os
+import shutil
 from pathlib import Path
 from typing import List
 from mcp.server.fastmcp import FastMCP
 
-# Bibliotecas de Extração
+# Extratores
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
+
+# Vector Store & Embeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
 
 # --- CONFIGURAÇÃO (SANDBOX) ---
 TARGET_DIRECTORY = Path("./dados_processos")
 TARGET_DIRECTORY.mkdir(parents=True, exist_ok=True)
+CHROMA_PATH = "./chroma_db_store" # Pasta onde o banco vetorial será salvo
 
 # Inicializa o Servidor
-mcp = FastMCP("Universal Document Processor")
+mcp = FastMCP("Universal Document Processor + RAG")
 
-# --- FUNÇÕES AUXILIARES DE LEITURA ---
-def extract_text_from_pdf(file_path: Path) -> str:
+# Modelo local, leve e eficiente para CPU
+embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Inicializa o Banco Vetorial (Persistente)
+vector_db = Chroma(
+    persist_directory=CHROMA_PATH,
+    embedding_function=embedding_function,
+    collection_name="processos_juridicos"
+)
+
+# --- FUNÇÕES AUXILIARES DE LEITURA (MANTIDAS) ---
+def extract_text_raw(file_path: Path) -> str:
+    """Extrai texto bruto dependendo da extensão."""
     try:
-        reader = PdfReader(file_path)
-        text = []
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                text.append(f"--- PÁGINA {i+1} ---\n{page_text}")
-        return "\n".join(text)
-    except Exception as e:
-        return f"[ERRO NO PDF: {str(e)}]"
-
-def extract_text_from_html(file_path: Path) -> str:
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-            for script in soup(["script", "style"]):
-                script.decompose()
-            return soup.get_text(separator='\n')
-    except Exception as e:
-        return f"[ERRO NO HTML: {str(e)}]"
-
-# --- FERRAMENTAS MCP (TOOLS) ---
-
-@mcp.tool()
-def list_available_files() -> List[str]:
-    """Lista arquivos na pasta de processos."""
-    try:
-        files = [f.name for f in TARGET_DIRECTORY.iterdir() if f.is_file()]
-        return sorted(files) if files else ["Nenhum arquivo encontrado."]
-    except Exception as e:
-        return [f"Erro: {str(e)}"]
-
-@mcp.tool()
-def read_file_content(filename: str) -> str:
-    """Lê conteúdo de PDF, HTML ou TXT."""
-    try:
-        file_path = (TARGET_DIRECTORY / filename).resolve()
-        if not file_path.is_relative_to(TARGET_DIRECTORY.resolve()):
-            return "ERRO DE SEGURANÇA."
-        
-        if not file_path.exists():
-            return "Arquivo não encontrado."
-
         suffix = file_path.suffix.lower()
         if suffix == '.pdf':
-            return extract_text_from_pdf(file_path)
-        elif suffix == '.html':
-            return extract_text_from_html(file_path)
+            reader = PdfReader(file_path)
+            text = []
+            for i, page in enumerate(reader.pages):
+                txt = page.extract_text()
+                if txt: text.append(txt)
+            return "\n".join(text)
+        elif suffix in ['.html', '.htm']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                soup = BeautifulSoup(f, 'html.parser')
+                for s in soup(["script", "style"]): s.decompose()
+                return soup.get_text(separator='\n')
         else:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
     except Exception as e:
-        return f"Erro: {str(e)}"
+        return ""
 
-# --- NOVA FERRAMENTA DE ESCRITA ---
+# --- FERRAMENTAS EXISTENTES (SIMPLIFICADAS) ---
+
+@mcp.tool()
+def list_available_files() -> List[str]:
+    """Lista arquivos na pasta."""
+    try:
+        return [f.name for f in TARGET_DIRECTORY.iterdir() if f.is_file()]
+    except: return []
+
+@mcp.tool()
+def read_file_content(filename: str) -> str:
+    """Lê o arquivo INTEIRO (Use apenas para arquivos pequenos ou resumos)."""
+    path = (TARGET_DIRECTORY / filename).resolve()
+    if not path.exists(): return "Arquivo não encontrado."
+    return extract_text_raw(path)
+
 @mcp.tool()
 def save_document(filename: str, content: str) -> str:
-    """
-    Salva um novo documento na pasta de processos.
-    Use esta ferramenta para escrever relatórios, minutas ou resumos.
-    O formato ideal é Markdown (.md) para manter formatação.
-    """
+    """Salva um novo documento no disco."""
     try:
-        # Segurança: Garante que só salva na sandbox
-        safe_name = os.path.basename(filename)
-        file_path = TARGET_DIRECTORY / safe_name
-        
-        print(f"--- 💾 SALVANDO ARQUIVO: {safe_name} ---")
-        
-        with open(file_path, "w", encoding="utf-8") as f:
+        with open(TARGET_DIRECTORY / filename, "w", encoding="utf-8") as f:
             f.write(content)
-            
-        return f"Sucesso: Arquivo '{safe_name}' salvo com sucesso em {TARGET_DIRECTORY}."
-    except Exception as e:
-        return f"Erro ao salvar: {str(e)}"
+        return "Salvo com sucesso."
+    except Exception as e: return f"Erro: {e}"
+
+# --- NOVAS FERRAMENTAS DE RAG (VECTOR SEARCH) ---
+
+@mcp.tool()
+def index_document(filename: str) -> str:
+    """
+    IMPORTANTE: Executa a indexação vetorial de um arquivo.
+    Use isso ANTES de tentar pesquisar trechos nele.
+    Isso 'lê' o arquivo, quebra em pedaços e salva na memória de busca.
+    """
+    file_path = (TARGET_DIRECTORY / filename).resolve()
+    if not file_path.exists(): return "Arquivo não encontrado."
+
+    # 1. Extrair Texto
+    raw_text = extract_text_raw(file_path)
+    if not raw_text: return "Não foi possível extrair texto ou arquivo vazio."
+
+    # 2. Quebrar em Chunks (Pedaços)
+    # Chunk size de 1000 caracteres com overlap de 200 é ideal para contexto jurídico
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.create_documents([raw_text], metadatas=[{"source": filename}])
+
+    # 3. Inserir no ChromaDB
+    # Isso converte texto em números (vetores) e salva no disco
+    vector_db.add_documents(chunks)
+    
+    return f"Sucesso: Arquivo '{filename}' indexado. Gerados {len(chunks)} fragmentos pesquisáveis."
+
+@mcp.tool()
+def search_knowledge_base(query: str, k: int = 4) -> str:
+    """
+    Pesquisa SEMÂNTICA no banco de dados.
+    Use para encontrar fatos específicos sem ler o arquivo todo.
+    Ex: query="O que a testemunha João disse sobre o vazamento?"
+    k: número de trechos para retornar (padrão 4).
+    """
+    print(f"--- 🔎 Buscando por: '{query}' ---")
+    results = vector_db.similarity_search(query, k=k)
+    
+    output = "--- RESULTADOS DA BUSCA RELEVANTES ---\n"
+    for i, res in enumerate(results):
+        source = res.metadata.get("source", "desconhecido")
+        output += f"\n[Trecho {i+1} | Fonte: {source}]:\n...{res.page_content}...\n"
+    
+    return output
 
 if __name__ == "__main__":
     mcp.run()

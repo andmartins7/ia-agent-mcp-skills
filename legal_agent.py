@@ -87,8 +87,21 @@ async def run_agent_session():
                     """Salva um documento/relatório no disco."""
                     result = await session.call_tool("save_document", arguments={"filename": filename, "content": content})
                     return result.content[0].text
+                
+                @tool
+                async def index_document_tool(filename: str):
+                    """Indexa um arquivo para busca vetorial. Obrigatório antes de pesquisar."""
+                    result = await session.call_tool("index_document", arguments={"filename": filename})
+                    return result.content[0].text
+                
+                @tool
+                async def search_tool(query: str):
+                    """Pesquisa trechos específicos no banco de dados (RAG)."""
+                    # O Agente pode decidir quantos chunks quer, mas vamos fixar padrão ou deixar ele decidir
+                    result = await session.call_tool("search_knowledge_base", arguments={"query": query})
+                    return result.content[0].text
 
-                tools = [list_files_tool, read_file_tool, save_file_tool]
+                tools = [list_files_tool, read_file_tool, save_file_tool, index_document_tool, search_tool]
                 llm_with_tools = llm.bind_tools(tools)
 
                 # --- GRAFO ---
@@ -109,6 +122,10 @@ async def run_agent_session():
                             res = await read_file_tool.ainvoke(tool_call["args"])
                         elif tool_call["name"] == "save_file_tool":
                             res = await save_file_tool.ainvoke(tool_call["args"])
+                        elif tool_call["name"] == "index_document_tool":
+                            res = await index_document_tool.ainvoke(tool_call["args"])
+                        elif tool_call["name"] == "search_tool":
+                            res = await search_tool.ainvoke(tool_call["args"])
                         else: res = "Erro."
                         outputs.append(ToolMessage(content=str(res), tool_call_id=tool_call["id"], name=tool_call["name"]))
                     return {"messages": outputs}
@@ -134,10 +151,14 @@ async def run_agent_session():
                 config = {"configurable": {"thread_id": "juiz_principal"}}
 
                 system_instruction = """
-                Você é um Juiz Assistente Sênior. 
-                1. Use 'read_file_tool' para ler provas.
-                2. Use 'save_file_tool' APENAS uma vez para gerar minutas finais.
-                3. Se o usuário perguntar sobre algo que já discutimos, USE SUA MEMÓRIA.
+                Você é um Juiz Assistente Sênior com Memória Vetorial.
+                
+                ESTRATÉGIA DE TRABALHO:
+                1. PREPARAÇÃO: Ao iniciar um caso novo, use 'index_document_tool' para ler e memorizar os arquivos PDF/HTML.
+                2. INVESTIGAÇÃO: Para responder perguntas específicas (ex: datas, valores, testemunhas), NÃO leia o arquivo todo. Use 'search_tool' para encontrar o trecho exato.
+                3. ESCRITA: Use 'save_file_tool' para minutas.
+                
+                Seja eficiente. Não leia arquivos inteiros se puder pesquisar.
                 """
 
                 while True:
